@@ -39,6 +39,10 @@ class QwenImageFunControlNetModel(torch.nn.Module):
         self.dtype = dtype
         self.main_model_double = main_model_double
         self.injection_layers = tuple(injection_layers)
+        # Fun checkpoints can easily overpower base features when routed through
+        # generic ControlNet merge. Keep an internal conservative scale and let
+        # user-facing strength do the rest.
+        self.hint_scale = 0.35
         self.control_img_in = operations.Linear(control_in_features, inner_dim, device=device, dtype=dtype)
 
         self.control_blocks = torch.nn.ModuleList([])
@@ -166,7 +170,7 @@ class QwenImageFunControlNetModel(torch.nn.Module):
                 transformer_options=transformer_options,
             )
 
-            c_skip = block.after_proj(c_out)
+            c_skip = block.after_proj(c_out) * self.hint_scale
             all_c += [c_skip, c_out]
             c = torch.stack(all_c, dim=0)
 
