@@ -299,6 +299,17 @@ class ControlNet(ControlBase):
 
 
 class QwenFunControlNet(ControlNet):
+    def get_control(self, x_noisy, t, cond, batched_number, transformer_options):
+        # Fun checkpoints are more sensitive to high strengths in the generic
+        # ControlNet merge path. Use a soft response curve so strength=1.0 stays
+        # unchanged while >1 grows more gently.
+        original_strength = self.strength
+        self.strength = math.sqrt(max(self.strength, 0.0))
+        try:
+            return super().get_control(x_noisy, t, cond, batched_number, transformer_options)
+        finally:
+            self.strength = original_strength
+
     def pre_run(self, model, percent_to_timestep_function):
         super().pre_run(model, percent_to_timestep_function)
         self.set_extra_arg("base_model", model.diffusion_model)

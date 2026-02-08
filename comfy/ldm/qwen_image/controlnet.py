@@ -39,9 +39,9 @@ class QwenImageFunControlNetModel(torch.nn.Module):
         self.dtype = dtype
         self.main_model_double = main_model_double
         self.injection_layers = tuple(injection_layers)
-        # Internal base scale for Fun hints. Keep near 1.0 and rely on user-facing
-        # ControlNet strength for tuning; too small here effectively disables control.
-        self.hint_scale = 0.9
+        # Keep base hint scaling at 1.0 so user-facing strength behaves similarly
+        # to the reference Gen2/VideoX implementation around strength=1.
+        self.hint_scale = 1.0
         self.control_img_in = operations.Linear(control_in_features, inner_dim, device=device, dtype=dtype)
 
         self.control_blocks = torch.nn.ModuleList([])
