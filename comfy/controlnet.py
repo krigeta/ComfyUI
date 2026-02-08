@@ -655,7 +655,10 @@ def load_controlnet_qwen_fun(sd, model_options={}):
         model,
         compression_ratio=1,
         latent_format=latent_format,
-        concat_mask=True,
+        # Fun checkpoints already expect their own 33-channel context handling.
+        # Enabling generic concat_mask injects an extra mask channel at apply-time
+        # and breaks the intended fallback packing path.
+        concat_mask=False,
         load_device=load_device,
         manual_cast_dtype=manual_cast_dtype,
         extra_conds=[],
