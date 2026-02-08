@@ -65,6 +65,16 @@ class QwenImageFunControlNetModel(torch.nn.Module):
         if hint.ndim == 4:
             hint = hint.unsqueeze(2)
 
+        # Fun checkpoints are trained with 33 latent channels before 2x2 packing:
+        # [control_latent(16), mask(1), inpaint_latent(16)] -> 132 features.
+        # Default behavior (no inpaint input in stock Apply ControlNet) should use
+        # zeros for mask/inpaint branches, matching VideoX fallback semantics.
+        expected_c = self.control_img_in.weight.shape[1] // 4
+        if hint.shape[1] == 16 and expected_c == 33:
+            zeros_mask = torch.zeros_like(hint[:, :1])
+            zeros_inpaint = torch.zeros_like(hint)
+            hint = torch.cat([hint, zeros_mask, zeros_inpaint], dim=1)
+
         bs, c, t, h, w = hint.shape
         hidden_states = torch.nn.functional.pad(hint, (0, w % 2, 0, h % 2))
         orig_shape = hidden_states.shape
@@ -114,8 +124,9 @@ class QwenImageFunControlNetModel(torch.nn.Module):
             raise RuntimeError("Qwen Fun ControlNet requires a QwenImage base model at runtime.")
 
         encoder_hidden_states_mask = attention_mask
-        if encoder_hidden_states_mask is not None and not torch.is_floating_point(encoder_hidden_states_mask):
-            encoder_hidden_states_mask = (encoder_hidden_states_mask - 1).to(x.dtype) * torch.finfo(x.dtype).max
+        # Keep attention mask disabled inside Fun control blocks to mirror
+        # VideoX behavior (they rely on seq lengths for RoPE, not masked attention).
+        encoder_hidden_states_mask = None
 
         hidden_states, img_ids, _ = base_model.process_img(x)
         hint_tokens = self._process_hint_tokens(hint)
