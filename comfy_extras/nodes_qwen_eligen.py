@@ -198,6 +198,8 @@ class ApplyQwenImageEliGen(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="ApplyQwenImageEliGen",
+            display_name="Apply Qwen Image EliGen",
+            search_aliases=["eligen", "qwen eligen", "entity control"],
             category="advanced/loaders/qwen",
             inputs=[
                 io.Model.Input("model"),
@@ -209,8 +211,6 @@ class ApplyQwenImageEliGen(io.ComfyNode):
                     tooltip="One entity prompt per line, in the same order as mask_1 ... mask_10.",
                 ),
                 io.Float.Input("strength", default=1.0, min=0.0, max=10.0, step=0.01),
-            ],
-            optional_inputs=[
                 io.Mask.Input("mask_1", optional=True),
                 io.Mask.Input("mask_2", optional=True),
                 io.Mask.Input("mask_3", optional=True),
