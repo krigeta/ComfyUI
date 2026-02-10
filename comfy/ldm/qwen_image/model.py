@@ -11,6 +11,7 @@ from comfy.ldm.flux.layers import EmbedND
 import comfy.ldm.common_dit
 import comfy.patcher_extension
 from comfy.ldm.flux.math import apply_rope1
+from einops import rearrange
 
 class GELU(nn.Module):
     def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True, dtype=None, device=None, operations=None):
@@ -430,6 +431,9 @@ class QwenImageTransformer2DModel(nn.Module):
         additional_t_cond=None,
         transformer_options={},
         control=None,
+        eligen_entity_prompt_emb=None,
+        eligen_entity_prompt_emb_mask=None,
+        eligen_entity_masks=None,
         **kwargs
     ):
         timestep = timesteps
@@ -488,6 +492,76 @@ class QwenImageTransformer2DModel(nn.Module):
         hidden_states = self.img_in(hidden_states)
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        # Native EliGen path for Qwen Image (entity prompt/mask conditioning)
+        if eligen_entity_prompt_emb is not None and eligen_entity_prompt_emb_mask is not None and eligen_entity_masks is not None:
+            # project entity prompts into transformer text space
+            entity_prompt_emb = [self.txt_in(self.txt_norm(e)) for e in eligen_entity_prompt_emb]
+            all_prompt_emb = torch.cat(entity_prompt_emb + [encoder_hidden_states], dim=1)
+
+            # build text seq lens
+            base_len = attention_mask.sum(dim=1).tolist() if attention_mask is not None else [encoder_hidden_states.shape[1]]
+            entity_lens = [m.sum(dim=1).tolist() for m in eligen_entity_prompt_emb_mask]
+            seq_lens = [l[0] if isinstance(l, list) else int(l) for l in entity_lens] + [base_len[0] if isinstance(base_len, list) else int(base_len)]
+
+            # image token count
+            image_seq_len = hidden_states.shape[1]
+
+            # construct per-entity token masks over image tokens
+            masks = eligen_entity_masks
+            if masks.ndim == 4:
+                masks = masks.unsqueeze(2)
+            masks = masks.to(device=x.device, dtype=x.dtype)
+            n_entity = masks.shape[1]
+
+            # approximate token grid from current image token count
+            side = int(image_seq_len ** 0.5)
+            h_tokens = 1
+            for d in range(max(1, side), 0, -1):
+                if image_seq_len % d == 0:
+                    h_tokens = d
+                    break
+            w_tokens = max(1, image_seq_len // h_tokens)
+
+            patched_masks = []
+            for i in range(n_entity):
+                m = masks[:, i, 0:1]
+                m = torch.nn.functional.interpolate(m, size=(h_tokens, w_tokens), mode="nearest")
+                patched_masks.append((m > 0).reshape(m.shape[0], -1))
+            patched_masks.append(torch.ones_like(patched_masks[0], dtype=torch.bool))
+
+            # build attention mask [B, 1, T, T]
+            total_txt = sum(seq_lens)
+            total_seq = total_txt + image_seq_len
+            attn = torch.ones((x.shape[0], total_seq, total_seq), dtype=torch.bool, device=x.device)
+
+            cumsum = [0]
+            for s in seq_lens:
+                cumsum.append(cumsum[-1] + int(s))
+            img_start = total_txt
+            img_end = total_seq
+
+            # prompt-image region masking
+            for i in range(len(patched_masks)):
+                p0, p1 = cumsum[i], cumsum[i + 1]
+                image_mask = patched_masks[i].unsqueeze(1).repeat(1, max(1, p1 - p0), 1)
+                attn[:, p0:p1, img_start:img_end] = image_mask
+                attn[:, img_start:img_end, p0:p1] = image_mask.transpose(1, 2)
+
+            # disable prompt-prompt cross entity attention
+            for i in range(len(seq_lens)):
+                for j in range(len(seq_lens)):
+                    if i == j:
+                        continue
+                    i0, i1 = cumsum[i], cumsum[i + 1]
+                    j0, j1 = cumsum[j], cumsum[j + 1]
+                    attn[:, i0:i1, j0:j1] = False
+
+            attn = attn.float()
+            attn[attn == 0] = float("-inf")
+            attn[attn == 1] = 0
+            encoder_hidden_states = all_prompt_emb
+            encoder_hidden_states_mask = attn.unsqueeze(1).to(dtype=x.dtype)
 
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
