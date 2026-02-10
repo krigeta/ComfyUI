@@ -8,10 +8,6 @@ import comfy.model_base
 from comfy_api.latest import ComfyExtension, io
 
 
-def _split_lines(text: str) -> list[str]:
-    return [line.strip() for line in text.splitlines() if line.strip()]
-
-
 def _ensure_mask_tensor(mask: torch.Tensor) -> torch.Tensor:
     # Expected MASK tensor shape in ComfyUI: [B, H, W]
     if mask.ndim == 2:
@@ -29,7 +25,8 @@ class _EliGenRuntimeContext:
     base_txt_tokens: int
     image_tokens: int
     entity_token_ranges: list[tuple[int, int]]
-    entity_assignments: torch.Tensor  # [B, image_tokens], long, -1 means background
+    entity_assignments: torch.Tensor  # [B, image_tokens], long, -1 = background
+    apply_per_batch: torch.Tensor  # [B], bool
     strength: float
 
 
@@ -40,76 +37,89 @@ class QwenImageEliGenPatch:
         entity_masks: torch.Tensor,
         txt_norm: torch.nn.Module,
         txt_in: torch.nn.Module,
+        enable_on_negative: bool = False,
         strength: float = 1.0,
     ):
-        # Store raw CLIP/Qwen text embeddings (3584 for Qwen Image TE), then
-        # project to model inner dim (3072) inside the patch using model txt_norm/txt_in.
+        # raw encoder outputs (Qwen TE width 3584), projected later into model width 3072
         self.entity_prompt_embeds = [e.detach().cpu() for e in entity_prompt_embeds]
         self.entity_masks = entity_masks.detach().float().cpu()
         self.txt_norm = txt_norm
         self.txt_in = txt_in
+        self.enable_on_negative = bool(enable_on_negative)
         self.strength = float(strength)
 
-    def _entity_prompt_embeds_for(self, txt: torch.Tensor) -> tuple[list[torch.Tensor], list[tuple[int, int]], int]:
+    def _entity_prompt_embeds_for(self, txt: torch.Tensor):
         embeds = []
         ranges = []
         start = txt.shape[1]
+
         for emb in self.entity_prompt_embeds:
             emb_t = emb.to(device=txt.device, dtype=txt.dtype)
             if emb_t.shape[0] != txt.shape[0]:
                 emb_t = emb_t.repeat(txt.shape[0], 1, 1)
-            # Project from text-encoder hidden dim to QwenImage transformer dim.
             emb_t = self.txt_in(self.txt_norm(emb_t))
             end = start + emb_t.shape[1]
             ranges.append((start, end))
             start = end
             embeds.append(emb_t)
+
         total_tokens = start - txt.shape[1]
         return embeds, ranges, total_tokens
 
-    def _entity_assignment_for(self, x: torch.Tensor, image_tokens: int, batch_size: int, device: torch.device) -> torch.Tensor:
-        # x for Qwen-Image is [B, C, T, H, W]
-        if x.ndim != 5:
-            return torch.full((batch_size, image_tokens), -1, dtype=torch.long, device=device)
+    def _entity_assignment_for_img_tokens(self, image_tokens: int, batch_size: int, device: torch.device):
+        if image_tokens <= 0:
+            return torch.full((batch_size, 0), -1, dtype=torch.long, device=device)
 
-        _, _, t, h, w = x.shape
-        token_h = (h + 1) // 2
-        token_w = (w + 1) // 2
+        side = int(round(image_tokens ** 0.5))
+        if side * side > image_tokens:
+            side -= 1
+        if side <= 0:
+            side = 1
+
+        token_h, token_w = side, max(1, image_tokens // side)
+        if token_h * token_w > image_tokens:
+            token_w = max(1, image_tokens // token_h)
 
         masks = self.entity_masks.to(device=device)
         masks = F.interpolate(masks.unsqueeze(1), size=(token_h, token_w), mode="nearest").squeeze(1)
+        max_vals, max_idx = masks.max(dim=0)
+        assignment_hw = torch.where(max_vals > 0.5, max_idx, torch.full_like(max_idx, -1)).reshape(1, -1)
 
-        # resolve overlaps by argmax, background = all zeros
-        max_vals, max_idx = masks.max(dim=0)  # [token_h, token_w]
-        assignment_hw = torch.where(max_vals > 0.5, max_idx, torch.full_like(max_idx, -1))
-        assignment_hw = assignment_hw.reshape(1, -1)  # [1, token_h * token_w]
-
-        # Qwen image token order uses T first, then H/W in each frame
-        assignment = assignment_hw.repeat(1, t).reshape(1, -1)
-
-        if assignment.shape[1] != image_tokens:
-            # safety fallback when shape assumptions drift
-            return torch.full((batch_size, image_tokens), -1, dtype=torch.long, device=device)
+        if assignment_hw.shape[1] < image_tokens:
+            pad = torch.full((1, image_tokens - assignment_hw.shape[1]), -1, dtype=assignment_hw.dtype, device=assignment_hw.device)
+            assignment = torch.cat([assignment_hw, pad], dim=1)
+        else:
+            assignment = assignment_hw[:, :image_tokens]
 
         return assignment.repeat(batch_size, 1)
 
-    def _build_runtime_context(self, args: dict, txt_ext: torch.Tensor, entity_token_ranges: list[tuple[int, int]]) -> _EliGenRuntimeContext:
+    def _build_runtime_context(self, args: dict, txt_ext: torch.Tensor, entity_token_ranges):
         img = args["img"]
-        x = args["x"]
+        to = args["transformer_options"]
+
         base_txt_tokens = txt_ext.shape[1] - sum((r[1] - r[0]) for r in entity_token_ranges)
         image_tokens = img.shape[1]
-        entity_assignments = self._entity_assignment_for(x, image_tokens, img.shape[0], img.device)
+        entity_assignments = self._entity_assignment_for_img_tokens(image_tokens, img.shape[0], img.device)
+
+        apply_per_batch = torch.ones((img.shape[0],), dtype=torch.bool, device=img.device)
+        if not self.enable_on_negative:
+            cond_or_uncond = to.get("cond_or_uncond", None)
+            if isinstance(cond_or_uncond, list) and len(cond_or_uncond) == img.shape[0]:
+                # Comfy sampler convention: 0 => positive, 1 => negative
+                apply_per_batch = torch.tensor([v == 0 for v in cond_or_uncond], dtype=torch.bool, device=img.device)
+
         return _EliGenRuntimeContext(
             base_txt_tokens=base_txt_tokens,
             image_tokens=image_tokens,
             entity_token_ranges=entity_token_ranges,
             entity_assignments=entity_assignments,
+            apply_per_batch=apply_per_batch,
             strength=self.strength,
         )
 
     def _attention_override(self, func, *attn_args, **attn_kwargs):
         transformer_options = attn_kwargs.get("transformer_options", {})
-        ctx: _EliGenRuntimeContext | None = transformer_options.get("_qwen_eligen_ctx", None)
+        ctx = transformer_options.get("_qwen_eligen_ctx", None)
         if ctx is None:
             return func(*attn_args, **attn_kwargs)
 
@@ -119,29 +129,30 @@ class QwenImageEliGenPatch:
 
         b, _, seq_q, _ = q.shape
         total_txt = ctx.base_txt_tokens + sum((end - start) for start, end in ctx.entity_token_ranges)
-        if seq_q < total_txt:
+        if seq_q < total_txt or total_txt <= 0:
             return func(*attn_args, **attn_kwargs)
 
         total_len = seq_q
         img_start = total_txt
-        neg = -torch.finfo(q.dtype).max * max(0.0, min(ctx.strength, 10.0))
+        neg = -80.0 * max(0.0, min(ctx.strength, 10.0))
 
         eligen_bias = torch.zeros((b, 1, total_len, total_len), device=q.device, dtype=q.dtype)
         img_assign = ctx.entity_assignments.to(device=q.device)
 
         for entity_id, (tok_start, tok_end) in enumerate(ctx.entity_token_ranges):
-            disallow = (img_assign != entity_id).unsqueeze(1).unsqueeze(-1)  # [B,1,img_tokens,1]
+            disallow = (img_assign != entity_id).unsqueeze(1).unsqueeze(-1)
             eligen_bias[:, :, img_start:, tok_start:tok_end] = torch.where(
                 disallow,
                 torch.full((1,), neg, device=q.device, dtype=q.dtype),
                 torch.zeros((1,), device=q.device, dtype=q.dtype),
             )
 
+        # apply only on selected batch rows (positive by default)
+        row_mask = ctx.apply_per_batch.to(device=q.device, dtype=q.dtype).view(b, 1, 1, 1)
+        eligen_bias = eligen_bias * row_mask
+
         mask = attn_args[4] if len(attn_args) > 4 else None
-        if mask is None:
-            new_mask = eligen_bias
-        else:
-            new_mask = mask + eligen_bias
+        new_mask = eligen_bias if mask is None else (mask + eligen_bias)
 
         attn_args = list(attn_args)
         if len(attn_args) > 4:
@@ -184,12 +195,10 @@ class QwenImageEliGenPatch:
             else:
                 to["_qwen_eligen_ctx"] = prev_ctx
 
-        # Keep original text-token length expected by the main model path.
         out["txt"] = out["txt"][:, :txt.shape[1], :]
         return out
 
     def to(self, device_or_dtype):
-        # Called by ComfyUI patch loader. Keep tensors on CPU; move dynamically at runtime.
         return self
 
 
@@ -204,22 +213,28 @@ class ApplyQwenImageEliGen(io.ComfyNode):
             inputs=[
                 io.Model.Input("model"),
                 io.Clip.Input("clip"),
-                io.String.Input(
-                    "entity_prompts",
-                    multiline=True,
-                    dynamic_prompts=True,
-                    tooltip="One entity prompt per line, in the same order as mask_1 ... mask_10.",
-                ),
+                io.Bool.Input("eligen_enable_on_negative", default=False),
                 io.Float.Input("strength", default=1.0, min=0.0, max=10.0, step=0.01),
+
+                io.String.Input("entity_prompt_1", default="", multiline=True, optional=True),
                 io.Mask.Input("mask_1", optional=True),
+                io.String.Input("entity_prompt_2", default="", multiline=True, optional=True),
                 io.Mask.Input("mask_2", optional=True),
+                io.String.Input("entity_prompt_3", default="", multiline=True, optional=True),
                 io.Mask.Input("mask_3", optional=True),
+                io.String.Input("entity_prompt_4", default="", multiline=True, optional=True),
                 io.Mask.Input("mask_4", optional=True),
+                io.String.Input("entity_prompt_5", default="", multiline=True, optional=True),
                 io.Mask.Input("mask_5", optional=True),
+                io.String.Input("entity_prompt_6", default="", multiline=True, optional=True),
                 io.Mask.Input("mask_6", optional=True),
+                io.String.Input("entity_prompt_7", default="", multiline=True, optional=True),
                 io.Mask.Input("mask_7", optional=True),
+                io.String.Input("entity_prompt_8", default="", multiline=True, optional=True),
                 io.Mask.Input("mask_8", optional=True),
+                io.String.Input("entity_prompt_9", default="", multiline=True, optional=True),
                 io.Mask.Input("mask_9", optional=True),
+                io.String.Input("entity_prompt_10", default="", multiline=True, optional=True),
                 io.Mask.Input("mask_10", optional=True),
             ],
             outputs=[
@@ -232,44 +247,46 @@ class ApplyQwenImageEliGen(io.ComfyNode):
         cls,
         model,
         clip,
-        entity_prompts,
+        eligen_enable_on_negative,
         strength,
-        mask_1=None,
-        mask_2=None,
-        mask_3=None,
-        mask_4=None,
-        mask_5=None,
-        mask_6=None,
-        mask_7=None,
-        mask_8=None,
-        mask_9=None,
-        mask_10=None,
+        entity_prompt_1="", mask_1=None,
+        entity_prompt_2="", mask_2=None,
+        entity_prompt_3="", mask_3=None,
+        entity_prompt_4="", mask_4=None,
+        entity_prompt_5="", mask_5=None,
+        entity_prompt_6="", mask_6=None,
+        entity_prompt_7="", mask_7=None,
+        entity_prompt_8="", mask_8=None,
+        entity_prompt_9="", mask_9=None,
+        entity_prompt_10="", mask_10=None,
+        **kwargs,
     ) -> io.NodeOutput:
         if not isinstance(model.model, comfy.model_base.QwenImage):
             raise ValueError("ApplyQwenImageEliGen only supports Qwen Image models.")
 
-        prompts = _split_lines(entity_prompts)
+        raw_pairs = [
+            (entity_prompt_1, mask_1), (entity_prompt_2, mask_2), (entity_prompt_3, mask_3), (entity_prompt_4, mask_4), (entity_prompt_5, mask_5),
+            (entity_prompt_6, mask_6), (entity_prompt_7, mask_7), (entity_prompt_8, mask_8), (entity_prompt_9, mask_9), (entity_prompt_10, mask_10),
+        ]
+
+        prompts = []
+        masks = []
+        for idx, (p, m) in enumerate(raw_pairs, start=1):
+            p = (p or "").strip()
+            if p == "" and m is None:
+                continue
+            if p == "" and m is not None:
+                raise ValueError(f"mask_{idx} is connected but entity_prompt_{idx} is empty.")
+            if p != "" and m is None:
+                raise ValueError(f"entity_prompt_{idx} is set but mask_{idx} is not connected.")
+            mm = _ensure_mask_tensor(m)
+            prompts.append(p)
+            masks.append(mm[0:1])
+
         if len(prompts) == 0:
-            return io.NodeOutput(model)
+            raise ValueError("At least one entity prompt/mask pair is required.")
 
-        raw_masks = [mask_1, mask_2, mask_3, mask_4, mask_5, mask_6, mask_7, mask_8, mask_9, mask_10]
-        masks_list = []
-        for m in raw_masks:
-            if m is not None:
-                mm = _ensure_mask_tensor(m)
-                # take first mask in case an upstream node sends batch; one input socket = one entity
-                masks_list.append(mm[0:1])
-
-        if len(masks_list) == 0:
-            raise ValueError("At least one entity mask (mask_1 ... mask_10) is required.")
-
-        if len(prompts) > len(masks_list):
-            raise ValueError(f"Entity prompts count ({len(prompts)}) exceeds provided masks ({len(masks_list)}).")
-
-        # Use as many pairs as available, up to 10.
-        pair_count = min(len(prompts), len(masks_list), 10)
-        prompts = prompts[:pair_count]
-        masks = torch.cat(masks_list[:pair_count], dim=0)
+        masks_t = torch.cat(masks, dim=0)
 
         diffusion_model = model.get_model_object("diffusion_model")
         txt_norm = diffusion_model.txt_norm
@@ -281,7 +298,14 @@ class ApplyQwenImageEliGen(io.ComfyNode):
             enc = clip.encode_from_tokens(tokens, return_dict=True)
             embeds.append(enc["cond"])
 
-        patch = QwenImageEliGenPatch(embeds, masks, txt_norm=txt_norm, txt_in=txt_in, strength=strength)
+        patch = QwenImageEliGenPatch(
+            embeds,
+            masks_t,
+            txt_norm=txt_norm,
+            txt_in=txt_in,
+            enable_on_negative=eligen_enable_on_negative,
+            strength=strength,
+        )
 
         model_patched = model.clone()
         block_count = len(model_patched.get_model_object("diffusion_model.transformer_blocks"))
