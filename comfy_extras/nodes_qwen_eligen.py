@@ -17,6 +17,16 @@ def _ensure_mask_tensor(mask: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unsupported MASK tensor rank for EliGen: {mask.ndim}")
 
 
+def _normalize_mask(mask: torch.Tensor, target_h: int | None = None, target_w: int | None = None) -> torch.Tensor:
+    m = _ensure_mask_tensor(mask).float()
+    if target_h is not None and target_w is not None and (m.shape[-2] != target_h or m.shape[-1] != target_w):
+        m = torch.nn.functional.interpolate(m.unsqueeze(1), size=(target_h, target_w), mode="nearest").squeeze(1)
+    m = (m > 0).float()
+    if torch.sum(m) <= 0:
+        raise ValueError("Entity mask has no active pixels after normalization.")
+    return m
+
+
 def _encode_entity_prompt_qwen(clip, prompt: str):
     # Match QwenImage tokenizer template behavior
     tokens = clip.tokenize(prompt)
@@ -98,6 +108,18 @@ class ApplyQwenImageEliGen(io.ComfyNode):
             (entity_prompt_6, mask_6), (entity_prompt_7, mask_7), (entity_prompt_8, mask_8), (entity_prompt_9, mask_9), (entity_prompt_10, mask_10),
         ]
 
+        target_h = None
+        target_w = None
+        first_mask = None
+        for p, m in raw_pairs:
+            p = (p or "").strip()
+            if p != "" and m is not None:
+                first_mask = _ensure_mask_tensor(m)
+                break
+
+        if first_mask is not None:
+            target_h, target_w = first_mask.shape[-2], first_mask.shape[-1]
+
         entity_prompt_emb = []
         entity_prompt_emb_mask = []
         masks = []
@@ -114,7 +136,7 @@ class ApplyQwenImageEliGen(io.ComfyNode):
             emb, emb_mask = _encode_entity_prompt_qwen(clip, p)
             entity_prompt_emb.append(emb)
             entity_prompt_emb_mask.append(emb_mask)
-            mm = _ensure_mask_tensor(m)
+            mm = _normalize_mask(m, target_h=target_h, target_w=target_w)
             masks.append(mm[0:1])
 
         if len(entity_prompt_emb) == 0:

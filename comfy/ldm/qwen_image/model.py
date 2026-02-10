@@ -333,6 +333,10 @@ class LastLayer(nn.Module):
 
 
 class QwenImageTransformer2DModel(nn.Module):
+    LATENT_TO_PIXEL_RATIO = 8
+    PATCH_TO_LATENT_RATIO = 2
+    PATCH_TO_PIXEL_RATIO = LATENT_TO_PIXEL_RATIO * PATCH_TO_LATENT_RATIO
+
     def __init__(
         self,
         patch_size: int = 2,
@@ -420,6 +424,141 @@ class QwenImageTransformer2DModel(nn.Module):
         img_ids[:, :, :, 2] = img_ids[:, :, :, 2] + torch.linspace(w_offset, w_len - 1 + w_offset, steps=w_len, device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0) - (w_len // 2)
         return hidden_states, repeat(img_ids, "t h w c -> b (t h w) c", b=bs), orig_shape
 
+    def process_entity_masks(
+        self,
+        latents,
+        prompt_emb,
+        prompt_emb_mask,
+        entity_prompt_emb,
+        entity_prompt_emb_mask,
+        entity_masks,
+        img_ids,
+        base_image_seq_len,
+        transformer_options={},
+    ):
+        batch_size = latents.shape[0]
+
+        # normalize batch for entity prompt embeddings
+        normalized_entity_emb = []
+        for e in entity_prompt_emb:
+            if e.shape[0] == 1 and prompt_emb.shape[0] > 1:
+                e = e.repeat(prompt_emb.shape[0], 1, 1)
+            normalized_entity_emb.append(self.txt_in(self.txt_norm(e)))
+
+        all_prompt_emb = torch.cat(normalized_entity_emb + [prompt_emb], dim=1)
+
+        # normalize batch for entity prompt attention masks
+        normalized_entity_emb_mask = []
+        for m in entity_prompt_emb_mask:
+            if m.shape[0] == 1 and prompt_emb.shape[0] > 1:
+                m = m.repeat(prompt_emb.shape[0], 1)
+            normalized_entity_emb_mask.append(m)
+
+        if prompt_emb_mask is not None and prompt_emb_mask.ndim == 2 and not torch.is_floating_point(prompt_emb_mask):
+            global_seq_len = int(prompt_emb_mask[0].sum().item())
+        else:
+            global_seq_len = int(prompt_emb.shape[1])
+
+        seq_lens = [int(m[0].sum().item()) for m in normalized_entity_emb_mask] + [global_seq_len]
+
+        # rebuild text ids per-entity + global to align EliGen rotary indexing
+        txt_start = round(max(((latents.shape[-1] + (self.patch_size // 2)) // self.patch_size) // 2,
+                              ((latents.shape[-2] + (self.patch_size // 2)) // self.patch_size) // 2))
+        txt_ids_parts = []
+        for s in seq_lens:
+            ids = torch.arange(txt_start, txt_start + s, device=latents.device).reshape(1, -1, 1).repeat(batch_size, 1, 3)
+            txt_ids_parts.append(ids)
+        txt_ids = torch.cat(txt_ids_parts, dim=1)
+        rope_ids = torch.cat((txt_ids, img_ids), dim=1)
+        image_rotary_emb = self.pe_embedder(rope_ids).to(latents.dtype).contiguous()
+
+        # normalize entity masks batch and shape: [B, N, 1, H, W]
+        if entity_masks.ndim == 4:
+            entity_masks = entity_masks.unsqueeze(2)
+        if entity_masks.shape[0] == 1 and batch_size > 1:
+            entity_masks = entity_masks.repeat(batch_size, 1, 1, 1, 1)
+        entity_masks = entity_masks.to(device=latents.device, dtype=latents.dtype)
+
+        # align masks to padded latent spatial size
+        padded_h = latents.shape[-2]
+        padded_w = latents.shape[-1]
+        entity_masks = entity_masks.reshape(batch_size * entity_masks.shape[1], entity_masks.shape[2], entity_masks.shape[3], entity_masks.shape[4])
+        entity_masks = torch.nn.functional.interpolate(entity_masks, size=(padded_h, padded_w), mode="nearest")
+        entity_masks = entity_masks.reshape(batch_size, -1, 1, padded_h, padded_w)
+
+        n_entity = entity_masks.shape[1]
+        expanded_masks = entity_masks.repeat(1, 1, latents.shape[1], 1, 1)
+        entity_mask_list = [expanded_masks[:, i] for i in range(n_entity)]
+        global_mask = torch.ones_like(entity_mask_list[0])
+        mask_groups = entity_mask_list + [global_mask]
+
+        # deterministic patchification (2x2 on latent grid)
+        patch_h = padded_h // self.PATCH_TO_LATENT_RATIO
+        patch_w = padded_w // self.PATCH_TO_LATENT_RATIO
+        single_patch_tokens = patch_h * patch_w
+        total_image_seq = int(base_image_seq_len)
+
+        patched_masks = []
+        for m in mask_groups:
+            patched = rearrange(
+                m,
+                "B C (H P) (W Q) -> B (H W) (C P Q)",
+                H=patch_h,
+                W=patch_w,
+                P=self.PATCH_TO_LATENT_RATIO,
+                Q=self.PATCH_TO_LATENT_RATIO,
+            )
+            binary = torch.sum(patched, dim=-1) > 0
+            if total_image_seq > single_patch_tokens:
+                repeat_time = (total_image_seq + single_patch_tokens - 1) // single_patch_tokens
+                binary = binary.repeat(1, repeat_time)[:, :total_image_seq]
+            patched_masks.append(binary)
+
+        # full attention matrix over [txt + img]
+        total_txt = int(sum(seq_lens))
+        total_seq = int(total_txt + total_image_seq)
+        attn = torch.ones((batch_size, total_seq, total_seq), dtype=torch.bool, device=latents.device)
+
+        cumsum = [0]
+        for s in seq_lens:
+            cumsum.append(cumsum[-1] + int(s))
+        img_start = total_txt
+        img_end = total_seq
+
+        # prompt<->image restrictions
+        for i in range(len(patched_masks)):
+            p0, p1 = cumsum[i], cumsum[i + 1]
+            image_mask = patched_masks[i].unsqueeze(1).repeat(1, max(1, p1 - p0), 1)
+            attn[:, p0:p1, img_start:img_end] = image_mask
+            attn[:, img_start:img_end, p0:p1] = image_mask.transpose(1, 2)
+
+        # entity prompt isolation
+        for i in range(len(seq_lens)):
+            for j in range(len(seq_lens)):
+                if i == j:
+                    continue
+                i0, i1 = cumsum[i], cumsum[i + 1]
+                j0, j1 = cumsum[j], cumsum[j + 1]
+                attn[:, i0:i1, j0:j1] = False
+
+        attn = attn.float()
+        attn[attn == 0] = float("-inf")
+        attn[attn == 1] = 0
+
+        # CFG-aware mask policy: keep negative unconstrained unless explicitly requested
+        cond_or_uncond = transformer_options.get("cond_or_uncond", []) if transformer_options is not None else []
+        if len(cond_or_uncond) == batch_size and 0 in cond_or_uncond and 1 in cond_or_uncond:
+            standard = torch.zeros_like(attn)
+            selected = []
+            for i, cond_type in enumerate(cond_or_uncond):
+                if cond_type == 0:
+                    selected.append(attn[i:i + 1])
+                else:
+                    selected.append(standard[i:i + 1])
+            attn = torch.cat(selected, dim=0)
+
+        return all_prompt_emb, image_rotary_emb, attn.unsqueeze(1).to(dtype=latents.dtype)
+
     def forward(self, x, timestep, context, attention_mask=None, ref_latents=None, additional_t_cond=None, transformer_options={}, **kwargs):
         return comfy.patcher_extension.WrapperExecutor.new_class_executor(
             self._forward,
@@ -489,85 +628,31 @@ class QwenImageTransformer2DModel(nn.Module):
                     timestep = torch.cat([timestep, timestep * 0], dim=0)
                     timestep_zero_index = num_embeds
 
-        txt_start = round(max(((x.shape[-1] + (self.patch_size // 2)) // self.patch_size) // 2, ((x.shape[-2] + (self.patch_size // 2)) // self.patch_size) // 2))
-        txt_ids = torch.arange(txt_start, txt_start + context.shape[1], device=x.device).reshape(1, -1, 1).repeat(x.shape[0], 1, 3)
-        ids = torch.cat((txt_ids, img_ids), dim=1)
-        image_rotary_emb = self.pe_embedder(ids).to(x.dtype).contiguous()
-        del ids, txt_ids, img_ids
-
         hidden_states = self.img_in(hidden_states)
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
+        # build default rope for standard path
+        txt_start = round(max(((x.shape[-1] + (self.patch_size // 2)) // self.patch_size) // 2, ((x.shape[-2] + (self.patch_size // 2)) // self.patch_size) // 2))
+        txt_ids = torch.arange(txt_start, txt_start + context.shape[1], device=x.device).reshape(1, -1, 1).repeat(x.shape[0], 1, 3)
+        ids = torch.cat((txt_ids, img_ids), dim=1)
+        image_rotary_emb = self.pe_embedder(ids).to(x.dtype).contiguous()
+
         # Native EliGen path for Qwen Image (entity prompt/mask conditioning)
         if eligen_entity_prompt_emb is not None and eligen_entity_prompt_emb_mask is not None and eligen_entity_masks is not None:
-            # project entity prompts into transformer text space
-            entity_prompt_emb = [self.txt_in(self.txt_norm(e)) for e in eligen_entity_prompt_emb]
-            all_prompt_emb = torch.cat(entity_prompt_emb + [encoder_hidden_states], dim=1)
+            encoder_hidden_states, image_rotary_emb, encoder_hidden_states_mask = self.process_entity_masks(
+                latents=x,
+                prompt_emb=encoder_hidden_states,
+                prompt_emb_mask=attention_mask,
+                entity_prompt_emb=eligen_entity_prompt_emb,
+                entity_prompt_emb_mask=eligen_entity_prompt_emb_mask,
+                entity_masks=eligen_entity_masks,
+                img_ids=img_ids,
+                base_image_seq_len=hidden_states.shape[1],
+                transformer_options=transformer_options,
+            )
 
-            # build text seq lens
-            base_len = attention_mask.sum(dim=1).tolist() if attention_mask is not None else [encoder_hidden_states.shape[1]]
-            entity_lens = [m.sum(dim=1).tolist() for m in eligen_entity_prompt_emb_mask]
-            seq_lens = [l[0] if isinstance(l, list) else int(l) for l in entity_lens] + [base_len[0] if isinstance(base_len, list) else int(base_len)]
-
-            # image token count
-            image_seq_len = hidden_states.shape[1]
-
-            # construct per-entity token masks over image tokens
-            masks = eligen_entity_masks
-            if masks.ndim == 4:
-                masks = masks.unsqueeze(2)
-            masks = masks.to(device=x.device, dtype=x.dtype)
-            n_entity = masks.shape[1]
-
-            # approximate token grid from current image token count
-            side = int(image_seq_len ** 0.5)
-            h_tokens = 1
-            for d in range(max(1, side), 0, -1):
-                if image_seq_len % d == 0:
-                    h_tokens = d
-                    break
-            w_tokens = max(1, image_seq_len // h_tokens)
-
-            patched_masks = []
-            for i in range(n_entity):
-                m = masks[:, i, 0:1]
-                m = torch.nn.functional.interpolate(m, size=(h_tokens, w_tokens), mode="nearest")
-                patched_masks.append((m > 0).reshape(m.shape[0], -1))
-            patched_masks.append(torch.ones_like(patched_masks[0], dtype=torch.bool))
-
-            # build attention mask [B, 1, T, T]
-            total_txt = sum(seq_lens)
-            total_seq = total_txt + image_seq_len
-            attn = torch.ones((x.shape[0], total_seq, total_seq), dtype=torch.bool, device=x.device)
-
-            cumsum = [0]
-            for s in seq_lens:
-                cumsum.append(cumsum[-1] + int(s))
-            img_start = total_txt
-            img_end = total_seq
-
-            # prompt-image region masking
-            for i in range(len(patched_masks)):
-                p0, p1 = cumsum[i], cumsum[i + 1]
-                image_mask = patched_masks[i].unsqueeze(1).repeat(1, max(1, p1 - p0), 1)
-                attn[:, p0:p1, img_start:img_end] = image_mask
-                attn[:, img_start:img_end, p0:p1] = image_mask.transpose(1, 2)
-
-            # disable prompt-prompt cross entity attention
-            for i in range(len(seq_lens)):
-                for j in range(len(seq_lens)):
-                    if i == j:
-                        continue
-                    i0, i1 = cumsum[i], cumsum[i + 1]
-                    j0, j1 = cumsum[j], cumsum[j + 1]
-                    attn[:, i0:i1, j0:j1] = False
-
-            attn = attn.float()
-            attn[attn == 0] = float("-inf")
-            attn[attn == 1] = 0
-            encoder_hidden_states = all_prompt_emb
-            encoder_hidden_states_mask = attn.unsqueeze(1).to(dtype=x.dtype)
+        del ids, txt_ids, img_ids
 
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
