@@ -213,7 +213,7 @@ class ApplyQwenImageEliGen(io.ComfyNode):
             inputs=[
                 io.Model.Input("model"),
                 io.Clip.Input("clip"),
-                io.Bool.Input("eligen_enable_on_negative", default=False),
+                io.Boolean.Input("eligen_enable_on_negative", default=False),
                 io.Float.Input("strength", default=1.0, min=0.0, max=10.0, step=0.01),
 
                 io.String.Input("entity_prompt_1", default="", multiline=True, optional=True),
