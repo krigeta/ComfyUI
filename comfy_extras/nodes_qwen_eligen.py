@@ -27,6 +27,7 @@ class _EliGenRuntimeContext:
     entity_token_ranges: list[tuple[int, int]]
     entity_assignments: torch.Tensor  # [B, image_tokens], long, -1 = background
     apply_per_batch: torch.Tensor  # [B], bool
+    enabled_this_block: bool
     strength: float
 
 
@@ -105,12 +106,18 @@ class QwenImageEliGenPatch:
                 # Comfy sampler convention: 0 => positive, 1 => negative
                 apply_per_batch = torch.tensor([v == 0 for v in cond_or_uncond], dtype=torch.bool, device=img.device)
 
+        # Apply EliGen only in later diffusion blocks to reduce instability/artifacts.
+        block_index = int(to.get("block_index", 0))
+        total_blocks = max(1, int(to.get("total_blocks", 1)))
+        enabled_this_block = block_index >= (total_blocks // 3)
+
         return _EliGenRuntimeContext(
             base_txt_tokens=base_txt_tokens,
             image_tokens=image_tokens,
             entity_token_ranges=entity_token_ranges,
             entity_assignments=entity_assignments,
             apply_per_batch=apply_per_batch,
+            enabled_this_block=enabled_this_block,
             strength=self.strength,
         )
 
@@ -118,6 +125,8 @@ class QwenImageEliGenPatch:
         transformer_options = attn_kwargs.get("transformer_options", {})
         ctx = transformer_options.get("_qwen_eligen_ctx", None)
         if ctx is None:
+            return func(*attn_args, **attn_kwargs)
+        if not ctx.enabled_this_block:
             return func(*attn_args, **attn_kwargs)
 
         q = attn_args[0]
@@ -131,7 +140,7 @@ class QwenImageEliGenPatch:
 
         total_len = seq_q
         img_start = total_txt
-        neg = -12.0 * max(0.0, min(ctx.strength, 10.0))
+        neg = -4.0 * max(0.0, min(ctx.strength, 10.0))
 
         eligen_bias = torch.zeros((b, 1, total_len, total_len), device=q.device, dtype=q.dtype)
         img_assign = ctx.entity_assignments.to(device=q.device)
