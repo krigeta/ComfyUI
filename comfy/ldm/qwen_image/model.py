@@ -172,8 +172,14 @@ class Attention(nn.Module):
         joint_key = apply_rope1(joint_key, image_rotary_emb)
 
         if encoder_hidden_states_mask is not None:
-            attn_mask = torch.zeros((batch_size, 1, seq_txt + seq_img), dtype=hidden_states.dtype, device=hidden_states.device)
-            attn_mask[:, 0, :seq_txt] = encoder_hidden_states_mask
+            # Two supported mask forms:
+            # 1) text-only keep mask [B, seq_txt] -> expand to joint [B, 1, seq_txt + seq_img]
+            # 2) full joint attention mask [B, 1, seq_total, seq_total] (EliGen path)
+            if encoder_hidden_states_mask.ndim == 2:
+                attn_mask = torch.zeros((batch_size, 1, seq_txt + seq_img), dtype=hidden_states.dtype, device=hidden_states.device)
+                attn_mask[:, 0, :seq_txt] = encoder_hidden_states_mask
+            else:
+                attn_mask = encoder_hidden_states_mask
         else:
             attn_mask = None
 
