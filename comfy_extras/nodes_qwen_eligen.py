@@ -70,26 +70,19 @@ class QwenImageEliGenPatch:
         if image_tokens <= 0:
             return torch.full((batch_size, 0), -1, dtype=torch.long, device=device)
 
-        side = int(round(image_tokens ** 0.5))
-        if side * side > image_tokens:
-            side -= 1
-        if side <= 0:
-            side = 1
-
-        token_h, token_w = side, max(1, image_tokens // side)
-        if token_h * token_w > image_tokens:
-            token_w = max(1, image_tokens // token_h)
+        # choose an exact factorization closest to square for stable mask resize
+        side = int(image_tokens ** 0.5)
+        token_h = 1
+        for d in range(side, 0, -1):
+            if image_tokens % d == 0:
+                token_h = d
+                break
+        token_w = image_tokens // token_h
 
         masks = self.entity_masks.to(device=device)
         masks = F.interpolate(masks.unsqueeze(1), size=(token_h, token_w), mode="nearest").squeeze(1)
         max_vals, max_idx = masks.max(dim=0)
-        assignment_hw = torch.where(max_vals > 0.5, max_idx, torch.full_like(max_idx, -1)).reshape(1, -1)
-
-        if assignment_hw.shape[1] < image_tokens:
-            pad = torch.full((1, image_tokens - assignment_hw.shape[1]), -1, dtype=assignment_hw.dtype, device=assignment_hw.device)
-            assignment = torch.cat([assignment_hw, pad], dim=1)
-        else:
-            assignment = assignment_hw[:, :image_tokens]
+        assignment = torch.where(max_vals > 0.5, max_idx, torch.full_like(max_idx, -1)).reshape(1, -1)
 
         return assignment.repeat(batch_size, 1)
 
@@ -102,6 +95,10 @@ class QwenImageEliGenPatch:
         entity_assignments = self._entity_assignment_for_img_tokens(image_tokens, img.shape[0], img.device)
 
         apply_per_batch = torch.ones((img.shape[0],), dtype=torch.bool, device=img.device)
+        # no valid mask coverage -> do not apply EliGen to avoid over-constraining to black outputs
+        if (entity_assignments >= 0).sum().item() == 0:
+            apply_per_batch = torch.zeros((img.shape[0],), dtype=torch.bool, device=img.device)
+
         if not self.enable_on_negative:
             cond_or_uncond = to.get("cond_or_uncond", None)
             if isinstance(cond_or_uncond, list) and len(cond_or_uncond) == img.shape[0]:
@@ -134,7 +131,7 @@ class QwenImageEliGenPatch:
 
         total_len = seq_q
         img_start = total_txt
-        neg = -80.0 * max(0.0, min(ctx.strength, 10.0))
+        neg = -12.0 * max(0.0, min(ctx.strength, 10.0))
 
         eligen_bias = torch.zeros((b, 1, total_len, total_len), device=q.device, dtype=q.dtype)
         img_assign = ctx.entity_assignments.to(device=q.device)
@@ -206,7 +203,7 @@ class ApplyQwenImageEliGen(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="ApplyQwenImageEliGen",
+            node_id="ApplyQwenImageEliGenV2",
             display_name="Apply Qwen Image EliGen",
             search_aliases=["eligen", "qwen eligen", "entity control"],
             category="advanced/loaders/qwen",
